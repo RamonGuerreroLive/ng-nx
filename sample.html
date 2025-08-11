@@ -1,0 +1,298 @@
+1) DTOs for Kendo request/response
+// GridRequest.java
+package demo.grid;
+
+import java.util.List;
+
+public class GridRequest {
+  public Integer skip;
+  public Integer take;
+  public List<SortDescriptor> sort;
+  public FilterNode filter; // can be group or rule
+}
+
+class SortDescriptor {
+  public String field;
+  public String dir; // "asc" | "desc"
+}
+
+// Polymorphic filter tree
+public interface FilterNode {}
+
+class FilterGroup implements FilterNode {
+  public String logic; // "and" | "or"
+  public List<FilterNode> filters;
+}
+
+class FilterRule implements FilterNode {
+  public String field;
+  public String operator; // eq, contains, gt, ...
+  public Object value;     // may be String, Number, Boolean, etc.
+}
+
+// FilterNodeDeserializer.java
+package demo.grid;
+
+import com.fasterxml.jackson.core.JsonParser;
+import com.fasterxml.jackson.databind.*;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import java.io.IOException;
+import java.util.ArrayList;
+
+public class FilterNodeDeserializer extends JsonDeserializer<FilterNode> {
+  @Override public FilterNode deserialize(JsonParser p, DeserializationContext ctxt) throws IOException {
+    ObjectNode node = p.getCodec().readTree(p);
+    if (node.has("filters")) { // group
+      FilterGroup g = new FilterGroup();
+      g.logic = node.hasNonNull("logic") ? node.get("logic").asText() : "and";
+      g.filters = new ArrayList<>();
+      for (JsonNode fn : node.withArray("filters")) {
+        g.filters.add(ctxt.readTreeAsValue(fn, FilterNode.class));
+      }
+      return g;
+    } else { // rule
+      FilterRule r = new FilterRule();
+      r.field = node.get("field").asText();
+      r.operator = node.get("operator").asText();
+      r.value = node.has("value") && !node.get("value").isNull() ? ((ObjectMapper)p.getCodec()).treeToValue(node.get("value"), Object.class) : null;
+      return r;
+    }
+  }
+}
+
+
+// Register
+// JacksonConfig.java
+package demo.config;
+
+import com.fasterxml.jackson.databind.Module;
+import com.fasterxml.jackson.databind.module.SimpleModule;
+import demo.grid.FilterNode;
+import demo.grid.FilterNodeDeserializer;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+@Configuration
+public class JacksonConfig {
+  @Bean
+  public Module gridModule() {
+    SimpleModule m = new SimpleModule();
+    m.addDeserializer(FilterNode.class, new FilterNodeDeserializer());
+    return m;
+  }
+}
+
+
+// Sample Response
+// DataSourceResult.java
+package demo.grid;
+
+import java.util.List;
+
+public class DataSourceResult<T> {
+  public List<T> data;
+  public long total;
+  public DataSourceResult(List<T> data, long total) {
+    this.data = data;
+    this.total = total;
+  }
+}
+
+2) Example entity + repository
+// Customer.java
+package demo.customer;
+
+import jakarta.persistence.*;
+import java.time.Instant;
+
+@Entity
+public class Customer {
+  @Id @GeneratedValue(strategy = GenerationType.IDENTITY)
+  private Long id;
+
+  private String firstName;
+  private String lastName;
+  private Integer age;
+  private Instant createdAt;
+
+  // getters/setters omitted for brevity
+}
+
+// CustomerRepository.java
+package demo.customer;
+
+import org.springframework.data.jpa.repository.*;
+import org.springframework.stereotype.Repository;
+
+@Repository
+public interface CustomerRepository extends JpaRepository<Customer, Long>, JpaSpecificationExecutor<Customer> {}
+
+3) Specification builder for Kendo filters
+// GridSpecification.java
+package demo.grid;
+
+import org.springframework.data.jpa.domain.Specification;
+import jakarta.persistence.criteria.*;
+import java.util.*;
+import java.util.function.BiFunction;
+
+public class GridSpecification<T> {
+
+  public Specification<T> build(FilterNode root) {
+    if (root == null) return Specification.where(null);
+    return nodeToSpec(root);
+  }
+
+  private Specification<T> nodeToSpec(FilterNode node) {
+    if (node instanceof FilterGroup g) {
+      List<Specification<T>> specs = new ArrayList<>();
+      if (g.filters != null) {
+        for (FilterNode child : g.filters) {
+          Specification<T> s = nodeToSpec(child);
+          if (s != null) specs.add(s);
+        }
+      }
+      return combineGroup(specs, g.logic);
+    } else if (node instanceof FilterRule r) {
+      return ruleToSpec(r);
+    }
+    return null;
+  }
+
+  private Specification<T> combineGroup(List<Specification<T>> specs, String logic) {
+    if (specs.isEmpty()) return null;
+    Specification<T> acc = specs.get(0);
+    for (int i = 1; i < specs.size(); i++) {
+      acc = "or".equalsIgnoreCase(logic) ? acc.or(specs.get(i)) : acc.and(specs.get(i));
+    }
+    return acc;
+  }
+
+  private Specification<T> ruleToSpec(FilterRule r) {
+    String op = r.operator == null ? "eq" : r.operator.toLowerCase(Locale.ROOT);
+    return (root, query, cb) -> {
+      Path<?> path = resolvePath(root, r.field);
+      // For case-insensitive string ops: cast to String and lower()
+      boolean isString = path.getJavaType() == String.class;
+
+      return switch (op) {
+        case "eq" -> cb.equal(path, cast(path, r.value));
+        case "neq" -> cb.notEqual(path, cast(path, r.value));
+        case "gt" -> cb.greaterThan(asComparable(path), (Comparable) cast(path, r.value));
+        case "gte" -> cb.greaterThanOrEqualTo(asComparable(path), (Comparable) cast(path, r.value));
+        case "lt" -> cb.lessThan(asComparable(path), (Comparable) cast(path, r.value));
+        case "lte" -> cb.lessThanOrEqualTo(asComparable(path), (Comparable) cast(path, r.value));
+        case "contains" -> isString ? cb.like(cb.lower((Path<String>) path), "%" + toLower(r.value) + "%") : cb.conjunction();
+        case "doesnotcontain" -> isString ? cb.notLike(cb.lower((Path<String>) path), "%" + toLower(r.value) + "%") : cb.conjunction();
+        case "startswith" -> isString ? cb.like(cb.lower((Path<String>) path), toLower(r.value) + "%") : cb.conjunction();
+        case "endswith" -> isString ? cb.like(cb.lower((Path<String>) path), "%" + toLower(r.value)) : cb.conjunction();
+        case "isnull" -> cb.isNull(path);
+        case "isnotnull" -> cb.isNotNull(path);
+        case "isempty" -> isString ? cb.equal((Path<String>) path, "") : cb.disjunction();
+        case "isnotempty" -> isString ? cb.notEqual((Path<String>) path, "") : cb.disjunction();
+        default -> cb.conjunction();
+      };
+    };
+  }
+
+  @SuppressWarnings({"unchecked","rawtypes"})
+  private <Y> Expression<Comparable> asComparable(Path<Y> path) {
+    return (Expression<Comparable>) path;
+  }
+
+  private Object cast(Path<?> path, Object value) {
+    if (value == null) return null;
+    Class<?> t = path.getJavaType();
+    if (t.isInstance(value)) return value;
+    if (t == Integer.class) return Integer.valueOf(value.toString());
+    if (t == Long.class)    return Long.valueOf(value.toString());
+    if (t == Double.class)  return Double.valueOf(value.toString());
+    if (t == Boolean.class) return Boolean.valueOf(value.toString());
+    if (Enum.class.isAssignableFrom(t)) return Enum.valueOf((Class) t, value.toString());
+    // For dates/timestamps, parse as needed (e.g., Instant.parse)
+    if (t.getName().equals("java.time.Instant")) return java.time.Instant.parse(value.toString());
+    return value.toString();
+  }
+
+  private String toLower(Object v) { return v == null ? "" : v.toString().toLowerCase(Locale.ROOT); }
+
+  // Support nested properties via dot path, e.g., "address.city"
+  @SuppressWarnings({"rawtypes","unchecked"})
+  private Path resolvePath(From root, String field) {
+    if (field == null || !field.contains(".")) return root.get(field);
+    String[] parts = field.split("\\.");
+    Path p = root;
+    for (String part : parts) p = p.get(part);
+    return p;
+  }
+}
+
+4) REST controller
+// CustomerController.java
+package demo.customer;
+
+import demo.grid.*;
+import org.springframework.data.domain.*;
+import org.springframework.data.jpa.domain.Specification;
+import org.springframework.web.bind.annotation.*;
+import java.util.List;
+
+@RestController
+@RequestMapping("/api/customers")
+public class CustomerController {
+
+  private final CustomerRepository repo;
+
+  public CustomerController(CustomerRepository repo) { this.repo = repo; }
+
+  @PostMapping("/search")
+  public DataSourceResult<Customer> search(@RequestBody GridRequest req) {
+    int size = (req.take == null || req.take <= 0) ? 20 : req.take;
+    int page = (req.skip == null || req.skip < 0) ? 0 : req.skip / size;
+    Sort sort = toSpringSort(req.sort);
+
+    Pageable pageable = PageRequest.of(page, size, sort);
+
+    Specification<Customer> spec = new GridSpecification<Customer>().build(req.filter);
+
+    var pageResult = repo.findAll(spec, pageable);
+    List<Customer> data = pageResult.getContent();
+    long total = pageResult.getTotalElements(); // Kendo expects total
+
+    return new DataSourceResult<>(data, total);
+  }
+
+  private Sort toSpringSort(List<SortDescriptor> sorts) {
+    if (sorts == null || sorts.isEmpty()) return Sort.unsorted();
+    Sort s = Sort.unsorted();
+    for (SortDescriptor sd : sorts) {
+      if (sd.field == null) continue;
+      Sort.Order o = "desc".equalsIgnoreCase(sd.dir) ?
+          Sort.Order.desc(sd.field) :
+          Sort.Order.asc(sd.field);
+      s = s.and(Sort.by(o));
+    }
+    return s;
+  }
+}
+
+5) Example Kendo request payload
+{
+  "skip": 0,
+  "take": 20,
+  "sort": [{ "field": "lastName", "dir": "asc" }],
+  "filter": {
+    "logic": "and",
+    "filters": [
+      { "field": "firstName", "operator": "contains", "value": "an" },
+      {
+        "logic": "or",
+        "filters": [
+          { "field": "age", "operator": "gte", "value": 30 },
+          { "field": "age", "operator": "isnull" }
+        ]
+      }
+    ]
+  }
+}
+
