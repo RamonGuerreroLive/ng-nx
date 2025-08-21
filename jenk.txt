@@ -1,0 +1,187 @@
+pipeline {
+    agent any
+    
+    environment {
+        REGISTRY_URL = 'your-registry-url'
+        PROJECT_NAME = 'your-openshift-project'
+        BUILD_NUMBER = "${env.BUILD_NUMBER}"
+    }
+    
+    stages {
+        stage('Build Angular Apps') {
+            steps {
+                script {
+                    sh 'npm run build:all'
+                }
+            }
+        }
+        
+        stage('Deploy Apps to OpenShift') {
+            steps {
+                script {
+                    // Define app configurations as an object
+                    def appConfigs = [
+                        [
+                            name: 'app1',
+                            displayName: 'Application 1',
+                            description: 'First Angular application',
+                            contextDir: 'dist/app1',
+                            port: 8080,
+                            replicas: 2,
+                            resources: [
+                                requests: [memory: '128Mi', cpu: '100m'],
+                                limits: [memory: '256Mi', cpu: '200m']
+                            ]
+                        ],
+                        [
+                            name: 'app2',
+                            displayName: 'Application 2', 
+                            description: 'Second Angular application',
+                            contextDir: 'dist/app2',
+                            port: 8081,
+                            replicas: 1,
+                            resources: [
+                                requests: [memory: '256Mi', cpu: '150m'],
+                                limits: [memory: '512Mi', cpu: '300m']
+                            ]
+                        ],
+                        [
+                            name: 'app3',
+                            displayName: 'Application 3',
+                            description: 'Third Angular application', 
+                            contextDir: 'dist/app3',
+                            port: 8082,
+                            replicas: 3,
+                            resources: [
+                                requests: [memory: '512Mi', cpu: '250m'],
+                                limits: [memory: '1Gi', cpu: '500m']
+                            ]
+                        ]
+                    ]
+                    
+                    // Loop through each app configuration
+                    appConfigs.each { appConfig ->
+                        echo "Processing app: ${appConfig.name}"
+                        deployAppToOpenShift(appConfig)
+                    }
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            echo "Pipeline completed for all apps"
+        }
+    }
+}
+
+// Helper function to deploy individual app using configuration object
+def deployAppToOpenShift(Map appConfig) {
+    def appName = appConfig.name
+    echo "Building image for ${appName} (${appConfig.displayName})..."
+    
+    try {
+        // Generate unique identifiers
+        def buildName = "${appName}-build-${BUILD_NUMBER}"
+        def workspacePath = "${env.WORKSPACE}/${appName}-workspace-${BUILD_NUMBER}"
+        
+        // Create unique workspace for each app
+        sh "mkdir -p ${workspacePath}"
+        
+        openshiftContainerPipelinePlugin {
+            // === CORE PARAMETERS (MUST BE UNIQUE) ===
+            buildName = buildName
+            buildConfigName = "${appName}-bc-${BUILD_NUMBER}"
+            imageStreamName = "${appName}-is-${BUILD_NUMBER}"
+            outputImageStreamName = "${appName}-output-${BUILD_NUMBER}"
+            
+            // === WORKSPACE AND BINARY PATHS (MUST BE UNIQUE) ===
+            workspacePath = workspacePath
+            openshiftBinPath = "/usr/local/bin/oc-${appName}"
+            
+            // === NAMESPACE PARAMETERS ===
+            buildConfigNamespace = "${PROJECT_NAME}-${appName}"
+            imageStreamNamespace = "${PROJECT_NAME}-${appName}"
+            outputImageStreamNamespace = "${PROJECT_NAME}-${appName}"
+            
+            // === LABELS WITH APP-SPECIFIC INFO ===
+            buildConfigLabels = "app=${appName},displayName=${appConfig.displayName},build=${BUILD_NUMBER},timestamp=${System.currentTimeMillis()}"
+            imageStreamLabels = "app=${appName},displayName=${appConfig.displayName},build=${BUILD_NUMBER},timestamp=${System.currentTimeMillis()}"
+            outputImageStreamLabels = "app=${appName},displayName=${appConfig.displayName},build=${BUILD_NUMBER},timestamp=${System.currentTimeMillis()}"
+            
+            // === ANNOTATIONS ===
+            buildConfigAnnotations = "app=${appName},description=${appConfig.description},port=${appConfig.port}"
+            imageStreamAnnotations = "app=${appName},description=${appConfig.description},port=${appConfig.port}"
+            outputImageStreamAnnotations = "app=${appName},description=${appConfig.description},port=${appConfig.port}"
+            
+            // === STANDARD PARAMETERS ===
+            imageStreamTag = 'latest'
+            sourceCodeRepository = 'your-git-repo'
+            sourceCodeBranch = 'main'
+            sourceCodeContextDir = appConfig.contextDir
+            outputImageStreamTag = 'latest'
+            openshiftUrl = 'your-openshift-url'
+            openshiftCredentialsId = 'your-credentials-id'
+            openshiftProjectName = PROJECT_NAME
+            registryUrl = REGISTRY_URL
+            registryCredentialsId = 'your-registry-credentials'
+            
+            // === ADVANCED PARAMETERS ===
+            buildConfigTemplate = "${appName}-template"
+            imageStreamTemplate = "${appName}-is-template"
+            outputImageStreamTemplate = "${appName}-output-template"
+            
+            // === SECRETS ===
+            buildConfigSecrets = "${appName}-secrets"
+            imageStreamSecrets = "${appName}-is-secrets"
+            outputImageStreamSecrets = "${appName}-output-secrets"
+        }
+        
+        echo "Successfully built image for ${appName}"
+        
+        // Optional: Create deployment configuration after build
+        createDeploymentConfig(appConfig)
+        
+    } catch (Exception e) {
+        echo "Failed to build image for ${appName}: ${e.getMessage()}"
+        currentBuild.result = 'UNSTABLE'
+    }
+}
+
+// Optional helper function to create deployment configuration
+def createDeploymentConfig(Map appConfig) {
+    def appName = appConfig.name
+    
+    try {
+        sh """
+            # Create deployment config with app-specific settings
+            oc create deployment ${appName} --image=${appName}-output:latest --replicas=${appConfig.replicas} --dry-run=client -o yaml > ${appName}-deployment.yaml
+            
+            # Add resource limits and requests
+            cat >> ${appName}-deployment.yaml << EOF
+            resources:
+              requests:
+                memory: ${appConfig.resources.requests.memory}
+                cpu: ${appConfig.resources.requests.cpu}
+              limits:
+                memory: ${appConfig.resources.limits.memory}
+                cpu: ${appConfig.resources.limits.cpu}
+            EOF
+            
+            # Apply the deployment
+            oc apply -f ${appName}-deployment.yaml
+            
+            # Create service
+            oc expose deployment ${appName} --port=${appConfig.port} --target-port=${appConfig.port}
+            
+            # Create route
+            oc expose service ${appName} --hostname=${appName}.${PROJECT_NAME}.your-domain.com
+        """
+        
+        echo "Successfully created deployment config for ${appName}"
+        
+    } catch (Exception e) {
+        echo "Failed to create deployment config for ${appName}: ${e.getMessage()}"
+    }
+}
